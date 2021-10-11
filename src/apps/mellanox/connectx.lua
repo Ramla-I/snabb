@@ -2392,8 +2392,8 @@ function selftest ()
       C.usleep(1e6)
    end
 
-   local bursts = 10000
-   local each   = 100
+   local bursts = 1 --0000
+   local each   = 1 --00
    local octets = 100
    print(("Links up. Sending %s packets."):format(lib.comma_value(each*bursts)))
 
@@ -2413,7 +2413,7 @@ function selftest ()
          app:pull()
          app:push()
          while not link.empty(io0.output.output) do packet.free(link.receive(io0.output.output)) end
-         while not link.empty(io1.output.output) do packet.free(link.receive(io1.output.output)) end
+         -- while not link.empty(io1.output.output) do packet.free(link.receive(io1.output.output)) end
       end
    end
    print("link", "txpkt", "txbyte", "txdrop")
@@ -2450,7 +2450,7 @@ function selftest ()
    for k in pairs(stat0) do table.insert(t, k) end
    table.sort(t)
    for _, k in pairs(t) do
-      print(("%-16s  %20s  %20s"):format(k, lib.comma_value(stat0[k]), lib.comma_value(stat1[k])))
+      print(("%-16s  %20s"):format(k, lib.comma_value(stat0[k])))
    end
 
    nic0:stop()
