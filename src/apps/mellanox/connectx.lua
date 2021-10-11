@@ -2362,32 +2362,33 @@ end
 function selftest ()
    io.stdout:setvbuf'no'
 
-   local pcidev0 = lib.getenv("SNABB_PCI_CONNECTX_0")
-   local pcidev1 = lib.getenv("SNABB_PCI_CONNECTX_1")
+   local pcidev0 = "59:00.0" --lib.getenv("SNABB_PCI_CONNECTX_0")
+   -- local pcidev1 = lib.getenv("SNABB_PCI_CONNECTX_1")
    -- XXX check PCI device type
    if not pcidev0 then
       print("SNABB_PCI_CONNECTX_0 not set")
       os.exit(engine.test_skipped_code)
    end
-   if not pcidev1 then
-      print("SNABB_PCI_CONNECTX_1 not set")
-      os.exit(engine.test_skipped_code)
-   end
+   -- if not pcidev1 then
+   --    print("SNABB_PCI_CONNECTX_1 not set")
+   --    os.exit(engine.test_skipped_code)
+   -- end
 
    local io0 = IO:new({pciaddress = pcidev0, queue = 'a'})
-   local io1 = IO:new({pciaddress = pcidev1, queue = 'b'})
+   -- local io1 = IO:new({pciaddress = pcidev1, queue = 'b'})
    io0.input  = { input = link.new('input0') }
    io0.output = { output = link.new('output0') }
-   io1.input  = { input = link.new('input1') }
-   io1.output = { output = link.new('output1') }
+   -- io1.input  = { input = link.new('input1') }
+   -- io1.output = { output = link.new('output1') }
    -- Exercise the IO apps before the NIC is initialized.
-   io0:pull() io0:push() io1:pull() io1:push()
+   io0:pull() io0:push() --io1:pull() io1:push()
    local nic0 = ConnectX:new{pciaddress = pcidev0, queues = {{id='a'}}}
-   local nic1 = ConnectX:new{pciaddress = pcidev1, queues = {{id='b'}}}
+   -- local nic1 = ConnectX:new{pciaddress = pcidev1, queues = {{id='b'}}}
 
    print("selftest: waiting for both links up")
-   while (nic0.hca:query_vport_state().oper_state ~= 1) or
-         (nic1.hca:query_vport_state().oper_state ~= 1) do
+   while (nic0.hca:query_vport_state().oper_state ~= 1) 
+      -- or (nic1.hca:query_vport_state().oper_state ~= 1) 
+      do
       C.usleep(1e6)
    end
 
@@ -2397,7 +2398,7 @@ function selftest ()
    print(("Links up. Sending %s packets."):format(lib.comma_value(each*bursts)))
 
    for i = 1, bursts + 100 do
-      for id, app in ipairs({io0, io1}) do
+      for id, app in ipairs({io0}) do
          if i <= bursts then
             for i = 1, each do
                local p = packet.allocate()
@@ -2417,13 +2418,13 @@ function selftest ()
    end
    print("link", "txpkt", "txbyte", "txdrop")
    local i0 = io0.input.input
-   local i1 = io1.input.input
+   -- local i1 = io1.input.input
    local o0 = io0.output.output
-   local o1 = io1.output.output
+   -- local o1 = io1.output.output
    print("send0", tonumber(counter.read(i0.stats.txpackets)), tonumber(counter.read(i0.stats.txbytes)), tonumber(counter.read(i0.stats.txdrop)))
-   print("send1", tonumber(counter.read(i1.stats.txpackets)), tonumber(counter.read(i1.stats.txbytes)), tonumber(counter.read(i1.stats.txdrop)))
+   -- print("send1", tonumber(counter.read(i1.stats.txpackets)), tonumber(counter.read(i1.stats.txbytes)), tonumber(counter.read(i1.stats.txdrop)))
    print("recv0", tonumber(counter.read(o0.stats.txpackets)), tonumber(counter.read(o0.stats.txbytes)), tonumber(counter.read(o0.stats.txdrop)))
-   print("recv1", tonumber(counter.read(o1.stats.txpackets)), tonumber(counter.read(o1.stats.txbytes)), tonumber(counter.read(o1.stats.txdrop)))
+   -- print("recv1", tonumber(counter.read(o1.stats.txpackets)), tonumber(counter.read(o1.stats.txbytes)), tonumber(counter.read(o1.stats.txdrop)))
 
    -- print("payload snippets of first 5 packets")
    -- print("port0")
@@ -2438,11 +2439,11 @@ function selftest ()
    -- end
 
    print()
-   print(("%-16s  %20s  %20s"):format("hardware counter", pcidev0, pcidev1))
+   print(("%-16s  %20s"):format("hardware counter", pcidev0))
    print("----------------  --------------------  --------------------")
 
    local stat0 = nic0.hca:query_vport_counter()
-   local stat1 = nic1.hca:query_vport_counter()
+   -- local stat1 = nic1.hca:query_vport_counter()
 
    -- Sort into key order
    local t = {}
@@ -2453,10 +2454,11 @@ function selftest ()
    end
 
    nic0:stop()
-   nic1:stop()
+   -- nic1:stop()
 
-   if (stat0.tx_ucast_packets == bursts*each and stat0.tx_ucast_octets == bursts*each*octets and
-       stat1.tx_ucast_packets == bursts*each and stat1.tx_ucast_octets == bursts*each*octets) then
+   if (stat0.tx_ucast_packets == bursts*each and stat0.tx_ucast_octets == bursts*each*octets) 
+      -- and stat1.tx_ucast_packets == bursts*each and stat1.tx_ucast_octets == bursts*each*octets) 
+      then
       print("selftest: ok")
    else
       error("selftest failed: unexpected counter values")

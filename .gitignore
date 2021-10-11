@@ -20,4 +20,5 @@ __pycache__
 /src/programs.inc
 .images
 /lib/luajit/usr
+/lib/luajit/src
 /src/program/programs.inc
