@@ -50,8 +50,10 @@ local band, bor, shl, shr, bswap, bnot =
    bit.band, bit.bor, bit.lshift, bit.rshift, bit.bswap, bit.bnot
 local cast, typeof = ffi.cast, ffi.typeof
 
-local debug_trace   = false     -- Print trace messages
-local debug_hexdump = false     -- Print hexdumps (in Linux mlx5 format)
+local debug_trace       = false     -- Print trace messages
+local debug_hexdump     = false     -- Print hexdumps (in Linux mlx5 format)
+local debug_parameters  = true     -- Print parameters
+local debug_queues      = true     -- Print hexdumps of the queue entries (in Linux mlx5 format)
 
 -- Maximum size of a receive queue table.
 -- XXX This is hard-coded in the Linux mlx5 driver too. Could
@@ -216,6 +218,8 @@ function ConnectX:new (conf)
 
    local mtu = conf.mtu or 9500
 
+   if debug_parameters then print('mtu = ', mtu) end
+
    -- Perform a hard reset of the device to bring it into a blank state.
    --
    -- Reset is performed at PCI level instead of via firmware command.
@@ -268,6 +272,14 @@ function ConnectX:new (conf)
    local tdomain = hca:alloc_transport_domain()
    local rlkey = hca:query_rlkey()
 
+   if debug_parameters then 
+      print('uar = ', uar)
+      print('eq = ', eq.eqn) 
+      print('pd = ', pd) 
+      print('tdomain = ', tdomain) 
+      print('rlkey = ', rlkey) 
+   end
+
    -- List of all receive queues for hashing traffic across
    local rqlist = {}
    local rqs = {}
@@ -287,6 +299,12 @@ function ConnectX:new (conf)
       usemac = usemac or (queue.mac ~= nil)
       usevlan = usevlan or (queue.vlan ~= nil)
    end
+
+   if debug_parameters then 
+      print('usemac = ', usemac)
+      print('usevlan = ', usevlan)
+   end
+
    -- Check if we support them
    if usemac then
       for _, queue in ipairs(conf.queues) do
@@ -316,6 +334,11 @@ function ConnectX:new (conf)
 
       check_qsize("Send", sendq_size)
       check_qsize("Receive", recvq_size)
+      
+      if debug_parameters then 
+         print('sendq size = ', sendq_size)
+         print('recvq size = ', recvq_size)
+      end
 
       cxq.rlkey = rlkey
       cxq.sqsize = sendq_size
@@ -329,6 +352,12 @@ function ConnectX:new (conf)
 
       local rq_stride = ffi.sizeof(ffi.typeof(cxq.rwq[0]))
       local sq_stride = ffi.sizeof(ffi.typeof(cxq.swq[0]))
+
+      if debug_parameters then 
+         print("sq stride = ", sq_stride)
+         print("rq stride = ", rq_stride)
+      end
+
       local workqueues = memory.dma_alloc(sq_stride * sendq_size +
                                              rq_stride *recvq_size, 4096)
       cxq.rwq = cast(ffi.typeof(cxq.rwq), workqueues)
@@ -369,230 +398,250 @@ function ConnectX:new (conf)
       -- XXX collect for flow table construction
       rqs[queue.id] = cxq.rqn
       rqlist[#rqlist+1] = cxq.rqn
+
+      if debug_queues then
+
+         print("Send CQE 0 (Initialized)")
+         hexdump(cxq.scq[0], 0, 0x40)
+
+         print("Send WQ (Initialized)")
+         for i = 0, sendq_size do
+            print("Send WQE ", i)
+            hexdump(cxq.swq[i], 0, 0x40)
+         end
+
+         print("EQ (Initialized)")
+         for i = 0, eq.n-1 do
+            print('EQE ', i)
+            hexdump(eq.ring[i], 0, 0x40)
+         end
+
+      end
+
    end
    
-   if usemac then
-      -- Collect macvlan_rqlist for flow table construction
-      for _, queue in ipairs(conf.queues) do
-         local vlan = queue.vlan or false
-         local mac = queue.mac
-         if not macvlan_rqlist[vlan] then
-            macvlan_rqlist[vlan] = {}
-         end
-         if not macvlan_rqlist[vlan][mac] then
-            macvlan_rqlist[vlan][mac] = {}
-         end
-         table.insert(macvlan_rqlist[vlan][mac], rqs[queue.id])         
-      end
-   end
+   -- if usemac then
+   --    -- Collect macvlan_rqlist for flow table construction
+   --    for _, queue in ipairs(conf.queues) do
+   --       local vlan = queue.vlan or false
+   --       local mac = queue.mac
+   --       if not macvlan_rqlist[vlan] then
+   --          macvlan_rqlist[vlan] = {}
+   --       end
+   --       if not macvlan_rqlist[vlan][mac] then
+   --          macvlan_rqlist[vlan][mac] = {}
+   --       end
+   --       table.insert(macvlan_rqlist[vlan][mac], rqs[queue.id])         
+   --    end
+   -- end
 
-   local function setup_rss_rxtable (rqlist, tdomain, level)
-      -- Set up RSS accross all queues. Hashing is only performed for
-      -- IPv4/IPv6 with or without TCP/UDP. All non-IP packets are
-      -- mapped to Queue #1.  Hashing is done by the TIR for a
-      -- specific combination of header values, hence separate flows
-      -- are needed to provide each TIR with the appropriate types of
-      -- packets.
-      local l3_protos = { 'v4', 'v6' }
-      local l4_protos = { 'udp', 'tcp' }
-      local rxtable = hca:create_flow_table(
-         -- #rules = #l3*l4 rules + #l3 rules + 1 wildcard rule
-         NIC_RX, level, #l3_protos * #l4_protos + #l3_protos + 1
-      )
-      local rqt = hca:create_rqt(rqlist)
-      local index = 0
-      -- Match TCP/UDP packets
-      local flow_group_ip = hca:create_flow_group_ip(
-         rxtable, NIC_RX, index, index + #l3_protos * #l4_protos - 1
-      )
-      for _, l3_proto in ipairs(l3_protos) do
-         for _, l4_proto in ipairs(l4_protos) do
-            local tir = hca:create_tir_indirect(rqt, tdomain,
-                                                l3_proto, l4_proto)
-            -- NOTE: flow table entries will only match if the packet
-            -- contains the complete L4 header. Keep this in mind when
-            -- processing truncated packets (e.g. from a port-mirror).
-            -- If the header is incomplete, the packet will fall through
-            -- to the wildcard match and end up in the first queue.
-            hca:set_flow_table_entry_ip(rxtable, NIC_RX, flow_group_ip,
-                                        index, TIR, tir, l3_proto, l4_proto)
-            index = index + 1
-         end
-      end
-      -- Fall-through for non-TCP/UDP IP packets
-      local flow_group_ip_l3 = hca:create_flow_group_ip(
-         rxtable, NIC_RX, index, index + #l3_protos - 1, "l3-only"
-      )
-      for _, l3_proto in ipairs(l3_protos) do
-         local tir = hca:create_tir_indirect(rqt, tdomain, l3_proto, nil)
-         hca:set_flow_table_entry_ip(rxtable, NIC_RX, flow_group_ip_l3,
-                                     index, TIR, tir, l3_proto, nil)
-         index = index + 1
-      end
-      -- Fall-through for non-IP packets
-      local flow_group_wildcard =
-         hca:create_flow_group_wildcard(rxtable, NIC_RX, index, index)
-      local tir_q1 = hca:create_tir_direct(rqlist[1], tdomain)
-      hca:set_flow_table_entry_wildcard(rxtable, NIC_RX,
-                                        flow_group_wildcard, index, TIR, tir_q1)
-      return rxtable
-   end
+   -- local function setup_rss_rxtable (rqlist, tdomain, level)
+   --    -- Set up RSS accross all queues. Hashing is only performed for
+   --    -- IPv4/IPv6 with or without TCP/UDP. All non-IP packets are
+   --    -- mapped to Queue #1.  Hashing is done by the TIR for a
+   --    -- specific combination of header values, hence separate flows
+   --    -- are needed to provide each TIR with the appropriate types of
+   --    -- packets.
+   --    local l3_protos = { 'v4', 'v6' }
+   --    local l4_protos = { 'udp', 'tcp' }
+   --    local rxtable = hca:create_flow_table(
+   --       -- #rules = #l3*l4 rules + #l3 rules + 1 wildcard rule
+   --       NIC_RX, level, #l3_protos * #l4_protos + #l3_protos + 1
+   --    )
+   --    local rqt = hca:create_rqt(rqlist)
+   --    local index = 0
+   --    -- Match TCP/UDP packets
+   --    local flow_group_ip = hca:create_flow_group_ip(
+   --       rxtable, NIC_RX, index, index + #l3_protos * #l4_protos - 1
+   --    )
+   --    for _, l3_proto in ipairs(l3_protos) do
+   --       for _, l4_proto in ipairs(l4_protos) do
+   --          local tir = hca:create_tir_indirect(rqt, tdomain,
+   --                                              l3_proto, l4_proto)
+   --          -- NOTE: flow table entries will only match if the packet
+   --          -- contains the complete L4 header. Keep this in mind when
+   --          -- processing truncated packets (e.g. from a port-mirror).
+   --          -- If the header is incomplete, the packet will fall through
+   --          -- to the wildcard match and end up in the first queue.
+   --          hca:set_flow_table_entry_ip(rxtable, NIC_RX, flow_group_ip,
+   --                                      index, TIR, tir, l3_proto, l4_proto)
+   --          index = index + 1
+   --       end
+   --    end
+   --    -- Fall-through for non-TCP/UDP IP packets
+   --    local flow_group_ip_l3 = hca:create_flow_group_ip(
+   --       rxtable, NIC_RX, index, index + #l3_protos - 1, "l3-only"
+   --    )
+   --    for _, l3_proto in ipairs(l3_protos) do
+   --       local tir = hca:create_tir_indirect(rqt, tdomain, l3_proto, nil)
+   --       hca:set_flow_table_entry_ip(rxtable, NIC_RX, flow_group_ip_l3,
+   --                                   index, TIR, tir, l3_proto, nil)
+   --       index = index + 1
+   --    end
+   --    -- Fall-through for non-IP packets
+   --    local flow_group_wildcard =
+   --       hca:create_flow_group_wildcard(rxtable, NIC_RX, index, index)
+   --    local tir_q1 = hca:create_tir_direct(rqlist[1], tdomain)
+   --    hca:set_flow_table_entry_wildcard(rxtable, NIC_RX,
+   --                                      flow_group_wildcard, index, TIR, tir_q1)
+   --    return rxtable
+   -- end
 
-   local function setup_macvlan_rxtable (macvlan_rqlist, usevlan, tdomain, level)
-      -- Set up MAC+VLAN switching.
-      -- 
-      -- For Unicast switch [MAC+VLAN->RSS->TIR]. I.e., forward packets
-      -- destined for a MAC+VLAN tuple to a RSS table containing all queues
-      -- belonging to that tuple.
-      -- (See notes on RSS in setup_rss_rxtable above.)
-      -- 
-      -- For Multicast switch [VLAN->TIR+]. I.e., forward multicast packets
-      -- destined for a VLAN to the first queue of every MAC in that VLAN.
-      -- 
-      local macvlan_size, mcast_size = 0, 0
-      for vlan in pairs(macvlan_rqlist) do
-         mcast_size = mcast_size + 1
-         for mac in pairs(macvlan_rqlist[vlan]) do
-            macvlan_size = macvlan_size + 1
-         end
-      end
-      local rxtable = hca:create_flow_table(
-         NIC_RX, level, macvlan_size + mcast_size
-      )
-      local index = 0
-      -- Unicast flow table entries
-      local flow_group_macvlan = hca:create_flow_group_macvlan(
-         rxtable, NIC_RX, index, index + macvlan_size - 1, usevlan
-      )
-      for vlan in pairs(macvlan_rqlist) do
-         for mac, rqlist in pairs(macvlan_rqlist[vlan]) do
-            local tid = setup_rss_rxtable(rqlist, tdomain, 1)
-            hca:set_flow_table_entry_macvlan(rxtable, NIC_RX, flow_group_macvlan, index,
-                                             FLOW_TABLE, tid, ethernet:ptoi(mac), vlan)
-            index = index + 1
-         end
-      end
-      -- Multicast flow table entries
-      local flow_group_mcast = hca:create_flow_group_macvlan(
-         rxtable, NIC_RX, index, index + mcast_size - 1, usevlan, 'mcast'
-      )
-      local mac_mcast = ethernet:ptoi("01:00:00:00:00:00")
-      for vlan in pairs(macvlan_rqlist) do
-         local mcast_tirs = {}
-         for mac, rqlist in pairs(macvlan_rqlist[vlan]) do
-            mcast_tirs[#mcast_tirs+1] = hca:create_tir_direct(rqlist[1], tdomain)
-         end
-         hca:set_flow_table_entry_macvlan(rxtable, NIC_RX, flow_group_mcast, index,
-                                          TIR, mcast_tirs, mac_mcast, vlan, 'mcast')
-         index = index + 1
-      end
-      return rxtable
-   end
+   -- local function setup_macvlan_rxtable (macvlan_rqlist, usevlan, tdomain, level)
+   --    -- Set up MAC+VLAN switching.
+   --    -- 
+   --    -- For Unicast switch [MAC+VLAN->RSS->TIR]. I.e., forward packets
+   --    -- destined for a MAC+VLAN tuple to a RSS table containing all queues
+   --    -- belonging to that tuple.
+   --    -- (See notes on RSS in setup_rss_rxtable above.)
+   --    -- 
+   --    -- For Multicast switch [VLAN->TIR+]. I.e., forward multicast packets
+   --    -- destined for a VLAN to the first queue of every MAC in that VLAN.
+   --    -- 
+   --    local macvlan_size, mcast_size = 0, 0
+   --    for vlan in pairs(macvlan_rqlist) do
+   --       mcast_size = mcast_size + 1
+   --       for mac in pairs(macvlan_rqlist[vlan]) do
+   --          macvlan_size = macvlan_size + 1
+   --       end
+   --    end
+   --    local rxtable = hca:create_flow_table(
+   --       NIC_RX, level, macvlan_size + mcast_size
+   --    )
+   --    local index = 0
+   --    -- Unicast flow table entries
+   --    local flow_group_macvlan = hca:create_flow_group_macvlan(
+   --       rxtable, NIC_RX, index, index + macvlan_size - 1, usevlan
+   --    )
+   --    for vlan in pairs(macvlan_rqlist) do
+   --       for mac, rqlist in pairs(macvlan_rqlist[vlan]) do
+   --          local tid = setup_rss_rxtable(rqlist, tdomain, 1)
+   --          hca:set_flow_table_entry_macvlan(rxtable, NIC_RX, flow_group_macvlan, index,
+   --                                           FLOW_TABLE, tid, ethernet:ptoi(mac), vlan)
+   --          index = index + 1
+   --       end
+   --    end
+   --    -- Multicast flow table entries
+   --    local flow_group_mcast = hca:create_flow_group_macvlan(
+   --       rxtable, NIC_RX, index, index + mcast_size - 1, usevlan, 'mcast'
+   --    )
+   --    local mac_mcast = ethernet:ptoi("01:00:00:00:00:00")
+   --    for vlan in pairs(macvlan_rqlist) do
+   --       local mcast_tirs = {}
+   --       for mac, rqlist in pairs(macvlan_rqlist[vlan]) do
+   --          mcast_tirs[#mcast_tirs+1] = hca:create_tir_direct(rqlist[1], tdomain)
+   --       end
+   --       hca:set_flow_table_entry_macvlan(rxtable, NIC_RX, flow_group_mcast, index,
+   --                                        TIR, mcast_tirs, mac_mcast, vlan, 'mcast')
+   --       index = index + 1
+   --    end
+   --    return rxtable
+   -- end
 
-   if usemac then
-      local rxtable = setup_macvlan_rxtable(macvlan_rqlist, usevlan, tdomain, 0)
-      hca:set_flow_table_root(rxtable, NIC_RX)
-   else
-      local rxtable = setup_rss_rxtable(rqlist, tdomain, 0)
-      hca:set_flow_table_root(rxtable, NIC_RX)
-   end
+   -- if usemac then
+   --    local rxtable = setup_macvlan_rxtable(macvlan_rqlist, usevlan, tdomain, 0)
+   --    hca:set_flow_table_root(rxtable, NIC_RX)
+   -- else
+   --    local rxtable = setup_rss_rxtable(rqlist, tdomain, 0)
+   --    hca:set_flow_table_root(rxtable, NIC_RX)
+   -- end
 
-   self.shm = {
-      mtu    = {counter, mtu},
-      txdrop = {counter}
-   }
+   -- self.shm = {
+   --    mtu    = {counter, mtu},
+   --    txdrop = {counter}
+   -- }
 
-   local vport_context = hca:query_nic_vport_context()
-   local frame = {
-      dtime     = {counter, C.get_unix_time()},
-      -- Keep a copy of the mtu here to have all
-      -- data available in a single shm frame
-      mtu       = {counter, mtu},
-      speed     = {counter},
-      status    = {counter, 2}, -- Link down
-      type      = {counter, 0x1000}, -- ethernetCsmacd
-      promisc   = {counter, vport_context.promisc_all},
-      macaddr   = {counter,
-                   macaddress:new(vport_context.permanent_address).bits},
-      rxbytes   = {counter},
-      rxpackets = {counter},
-      rxmcast   = {counter},
-      rxbcast   = {counter},
-      rxdrop    = {counter},
-      rxerrors  = {counter},
-      txbytes   = {counter},
-      txpackets = {counter},
-      txmcast   = {counter},
-      txbcast   = {counter},
-      txdrop    = {counter},
-      txerrors  = {counter},
-   }
-   self.stats = shm.create_frame("pci/"..pciaddress, frame)
+   -- local vport_context = hca:query_nic_vport_context()
+   -- local frame = {
+   --    dtime     = {counter, C.get_unix_time()},
+   --    -- Keep a copy of the mtu here to have all
+   --    -- data available in a single shm frame
+   --    mtu       = {counter, mtu},
+   --    speed     = {counter},
+   --    status    = {counter, 2}, -- Link down
+   --    type      = {counter, 0x1000}, -- ethernetCsmacd
+   --    promisc   = {counter, vport_context.promisc_all},
+   --    macaddr   = {counter,
+   --                 macaddress:new(vport_context.permanent_address).bits},
+   --    rxbytes   = {counter},
+   --    rxpackets = {counter},
+   --    rxmcast   = {counter},
+   --    rxbcast   = {counter},
+   --    rxdrop    = {counter},
+   --    rxerrors  = {counter},
+   --    txbytes   = {counter},
+   --    txpackets = {counter},
+   --    txmcast   = {counter},
+   --    txbcast   = {counter},
+   --    txdrop    = {counter},
+   --    txerrors  = {counter},
+   -- }
+   -- self.stats = shm.create_frame("pci/"..pciaddress, frame)
 
-   -- Create separate HCAs to retreive port statistics.  Those
-   -- commands must be called asynchronously to reduce latency.
-   self.stats_reqs = {
-      {
-        start_fn = HCA.get_port_stats_start,
-        finish_fn = HCA.get_port_stats_finish,
-        process_fn = function (r, stats)
-           local set = counter.set
-           set(stats.rxbytes, r.rxbytes)
-           set(stats.rxpackets, r.rxpackets)
-           set(stats.rxmcast, r.rxmcast)
-           set(stats.rxbcast, r.rxbcast)
-           if self.mlx == 4 then
-              -- ConnectX 4 doesn't have per-queue drop stats,
-              -- but this counter appears to always be zero :/
-              set(stats.rxdrop, r.rxdrop)
-           end
-           set(stats.rxerrors, r.rxerrors)
-           set(stats.txbytes, r.txbytes)
-           set(stats.txpackets, r.txpackets)
-           set(stats.txmcast, r.txmcast)
-           set(stats.txbcast, r.txbcast)
-           set(stats.txdrop, r.txdrop)
-           set(stats.txerrors, r.txerrors)
-        end
-      },
-      {
-        start_fn = HCA.get_port_speed_start,
-        finish_fn = HCA.get_port_speed_finish,
-        process_fn = function (r, stats)
-           counter.set(stats.speed, r)
-        end
-      },
-      {
-        start_fn = HCA.get_port_status_start,
-        finish_fn = HCA.get_port_status_finish,
-        process_fn = function (r, stats)
-           counter.set(stats.status, (r.oper_status == 1 and 1) or 2)
-        end
-      },
-   }
+   -- -- Create separate HCAs to retreive port statistics.  Those
+   -- -- commands must be called asynchronously to reduce latency.
+   -- self.stats_reqs = {
+   --    {
+   --      start_fn = HCA.get_port_stats_start,
+   --      finish_fn = HCA.get_port_stats_finish,
+   --      process_fn = function (r, stats)
+   --         local set = counter.set
+   --         set(stats.rxbytes, r.rxbytes)
+   --         set(stats.rxpackets, r.rxpackets)
+   --         set(stats.rxmcast, r.rxmcast)
+   --         set(stats.rxbcast, r.rxbcast)
+   --         if self.mlx == 4 then
+   --            -- ConnectX 4 doesn't have per-queue drop stats,
+   --            -- but this counter appears to always be zero :/
+   --            set(stats.rxdrop, r.rxdrop)
+   --         end
+   --         set(stats.rxerrors, r.rxerrors)
+   --         set(stats.txbytes, r.txbytes)
+   --         set(stats.txpackets, r.txpackets)
+   --         set(stats.txmcast, r.txmcast)
+   --         set(stats.txbcast, r.txbcast)
+   --         set(stats.txdrop, r.txdrop)
+   --         set(stats.txerrors, r.txerrors)
+   --      end
+   --    },
+   --    {
+   --      start_fn = HCA.get_port_speed_start,
+   --      finish_fn = HCA.get_port_speed_finish,
+   --      process_fn = function (r, stats)
+   --         counter.set(stats.speed, r)
+   --      end
+   --    },
+   --    {
+   --      start_fn = HCA.get_port_status_start,
+   --      finish_fn = HCA.get_port_status_finish,
+   --      process_fn = function (r, stats)
+   --         counter.set(stats.status, (r.oper_status == 1 and 1) or 2)
+   --      end
+   --    },
+   -- }
 
-   -- Empty for ConnectX4
-   for _, id in ipairs(counter_set_ids) do
-      table.insert(self.stats_reqs,
-                   {
-                      start_fn = HCA.query_q_counter_start,
-                      finish_fn = HCA.query_q_counter_finish,
-                      args = { set_id = id },
-                      process_fn = function(r, stats)
-                         -- Incremental update relies on query_q_counter to
-                         -- clear the counter after read.
-                         counter.set(stats.rxdrop,
-                                     counter.read(stats.rxdrop) + r.out_of_buffer)
-                      end
-      })
-   end
+   -- -- Empty for ConnectX4
+   -- for _, id in ipairs(counter_set_ids) do
+   --    table.insert(self.stats_reqs,
+   --                 {
+   --                    start_fn = HCA.query_q_counter_start,
+   --                    finish_fn = HCA.query_q_counter_finish,
+   --                    args = { set_id = id },
+   --                    process_fn = function(r, stats)
+   --                       -- Incremental update relies on query_q_counter to
+   --                       -- clear the counter after read.
+   --                       counter.set(stats.rxdrop,
+   --                                   counter.read(stats.rxdrop) + r.out_of_buffer)
+   --                    end
+   --    })
+   -- end
 
-   for _, req in ipairs(self.stats_reqs) do
-      req.hca = hca_factory:new()
-      -- Post command
-      req.start_fn(req.hca, req.args)
-   end
-   self.sync_timer = lib.throttle(1)
+   -- for _, req in ipairs(self.stats_reqs) do
+   --    req.hca = hca_factory:new()
+   --    -- Post command
+   --    req.start_fn(req.hca, req.args)
+   -- end
+   -- self.sync_timer = lib.throttle(1)
 
    function self:stop ()
       pci.set_bus_master(pciaddress, false)
@@ -601,21 +650,21 @@ function ConnectX:new (conf)
       mmio, fd = nil
    end
 
-   function self:pull ()
-      if self.sync_timer() then
-         self:sync_stats()
-      end
-   end
+   -- function self:pull ()
+   --    if self.sync_timer() then
+   --       self:sync_stats()
+   --    end
+   -- end
 
-   function self:sync_stats ()
-      for _, req in ipairs(self.stats_reqs) do
-         local hca = req.hca
-         if hca:completed() then
-            req.process_fn(req.finish_fn(hca), self.stats)
-            hca:post()
-         end
-      end
-   end
+   -- function self:sync_stats ()
+   --    for _, req in ipairs(self.stats_reqs) do
+   --       local hca = req.hca
+   --       if hca:completed() then
+   --          req.process_fn(req.finish_fn(hca), self.stats)
+   --          hca:post()
+   --       end
+   --    end
+   -- end
 
    -- Save "instance variable" values.
    self.hca = hca
@@ -2458,7 +2507,7 @@ function selftest ()
 
    if (stat0.tx_ucast_packets == bursts*each and stat0.tx_ucast_octets == bursts*each*octets) 
       -- and stat1.tx_ucast_packets == bursts*each and stat1.tx_ucast_octets == bursts*each*octets) 
-      then
+   then
       print("selftest: ok")
    else
       error("selftest failed: unexpected counter values")
