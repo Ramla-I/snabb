@@ -52,8 +52,8 @@ local cast, typeof = ffi.cast, ffi.typeof
 
 local debug_trace       = false     -- Print trace messages
 local debug_hexdump     = false     -- Print hexdumps (in Linux mlx5 format)
-local debug_parameters  = true     -- Print parameters
-local debug_queues      = true     -- Print hexdumps of the queue entries (in Linux mlx5 format)
+local debug_parameters  = false     -- Print parameters
+local debug_queues      = false     -- Print hexdumps of the queue entries (in Linux mlx5 format)
 
 -- Maximum size of a receive queue table.
 -- XXX This is hard-coded in the Linux mlx5 driver too. Could
@@ -1485,6 +1485,18 @@ function SQ:new (cxq, mmio)
       local start_wqeid = cxq.next_tx_wqeid
       local next_slot = slot(start_wqeid)
       while not link.empty(l) and cxq.tx[next_slot] == nil do
+
+         if debug_parameters then
+            print("sq:transmit")
+            local address = memory.virtual_to_physical(mmio)
+            print("mmio = "..bit.tohex(address, 14))
+            local address = memory.virtual_to_physical(cxq.bf_next)
+            print("bf next = "..bit.tohex(address, 14))
+            local address = memory.virtual_to_physical(cxq.bf_alt)
+            print("bf alt = "..bit.tohex(address, 14))
+            print("start_wqeid = ", start_wqeid)
+         end
+
          local p = link.receive(l)
          -- Store packet pointer so that we can free it later
          cxq.tx[next_slot] = p
@@ -1500,6 +1512,20 @@ function SQ:new (cxq, mmio)
          local current_packet = slot(cxq.next_tx_wqeid + cxq.sqsize-1)
          cxq.doorbell.send = bswap(cxq.next_tx_wqeid)
          cxq.bf_next[0] = cxq.swq[current_packet].u64[0]
+
+         if debug_parameters then
+            print("next_tx_wqeid = ", cxq.next_tx_wqeid)
+            print("sqsize = ", cxq.sqsize)
+            print("current packet = ", current_packet)
+            print("bf_next value", cxq.bf_next[0])
+            hexdump(cxq.bf_next, 0, 64)
+         end
+
+         if debug_queues then
+            print("Current WQE in transmit")
+            hexdump(cxq.swq[current_packet], 0, 64)
+         end
+
          -- Switch next/alternate blue flame register for next time
          cxq.bf_next, cxq.bf_alt = cxq.bf_alt, cxq.bf_next
       end
@@ -1567,6 +1593,12 @@ function SQ:new (cxq, mmio)
       local opcode = cxq.scq[0].u8[0x38]
       if opcode == 0x0A then
          local wqeid = shr(bswap(cxq.scq[0].u32[0x3C/4]), 16)
+         
+         if debug_queues  then
+            print("Reclaim SQ CQE 0")
+            dumpoffset = hexdump(cxq.scq[0], 0, 64)
+         end
+
          while next_reclaim ~= wqeid % cxq.sqsize do
             assert(cxq.tx[next_reclaim] ~= nil)
             packet.free(cxq.tx[next_reclaim])
